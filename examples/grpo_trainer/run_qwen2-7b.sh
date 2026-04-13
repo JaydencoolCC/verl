@@ -1,7 +1,5 @@
 set -x
 export WANDB_PROJECT="verl_grpo_example_gsm8k"
-export WANDB_ENTITY="jaycool"
-export WANDB_API_KEY="52c080a583ec102ea25df24a115fc0e0678aca35"
 export HF_ENDPOINT=https://hf-mirror.com
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HYDRA_FULL_ERROR=1
