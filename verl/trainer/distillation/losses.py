@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -120,12 +122,43 @@ def compute_distillation_loss_range(
     }
 
 
+def _dump_response_topk_probs(
+    data: TensorDict,
+    response_mask: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    student_topk_probs: torch.Tensor,
+    teacher_topk_probs: torch.Tensor,
+):
+    DEBUG_TOPK_PROBS_DIR = "/data/home/zhanghx/toy_try/verl/debug_topk_probs"
+    DEBUG_TOPK_MAX_SAMPLES_PER_CALL = 4
+    os.makedirs(DEBUG_TOPK_PROBS_DIR, exist_ok=True)
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    path = os.path.join(DEBUG_TOPK_PROBS_DIR, f"rank_{rank}_topk_probs.jsonl")
+
+    responses = data["responses"]
+    if responses.is_nested:
+        responses = responses.to_padded_tensor(0)
+
+    with open(path, "a", encoding="utf-8") as f:
+        for sample_idx in range(min(response_mask.shape[0], DEBUG_TOPK_MAX_SAMPLES_PER_CALL)):
+            mask = response_mask[sample_idx]
+            record = {
+                "sample_local_index": sample_idx,
+                "response_token_ids": responses[sample_idx][mask].detach().cpu().tolist(),
+                "teacher_topk_ids": teacher_topk_ids[sample_idx][mask].detach().cpu().tolist(),
+                "student_topk_probs": student_topk_probs[sample_idx][mask].detach().float().cpu().tolist(),
+                "teacher_topk_probs": teacher_topk_probs[sample_idx][mask].detach().float().cpu().tolist(),
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def compute_topk_loss(
     config: ActorConfig,
     distillation_config: DistillationConfig,
     data: TensorDict,
     student_logits: torch.Tensor,
     data_format: str,
+    sampled_token_ids: torch.Tensor = None,
 ) -> torch.Tensor:
     """Compute the topk loss in logit processor.
 
@@ -139,10 +172,18 @@ def compute_topk_loss(
         case "fsdp" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk":
+                distillation_loss_fn = fsdp_losses.compute_reverse_kl_topk
+            elif distillation_config.distillation_loss.loss_mode == "forward_kl_topk":
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            else:
+                raise NotImplementedError(
+                    f"Unsupported topk loss mode {distillation_config.distillation_loss.loss_mode} for strategy {config.strategy}."
+                )
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
-
+            if distillation_config.distillation_loss.loss_mode == "reverse_kl_topk":
+                raise NotImplementedError("reverse_kl_topk is currently only implemented for FSDP/VeOmni.")
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
         case _:
             raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
@@ -151,13 +192,17 @@ def compute_topk_loss(
         student_logits=student_logits,
         teacher_topk_log_probs=data["teacher_logprobs"],
         teacher_topk_ids=data["teacher_ids"],
+        sampled_token_ids=sampled_token_ids,
         config=distillation_config,
         data_format=data_format,
     )
 
     expected_shape = student_logits.shape[:2]
     for k, v in outputs.items():
-        assert v.shape == expected_shape, f"Expected shape {expected_shape}, but got {v.shape} for {k=}."
+        if k.startswith("debug_"):
+            assert v.shape[:2] == expected_shape, f"Expected shape prefix {expected_shape}, but got {v.shape} for {k=}."
+        else:
+            assert v.shape == expected_shape, f"Expected shape {expected_shape}, but got {v.shape} for {k=}."
 
     return outputs
 
@@ -169,6 +214,7 @@ def distillation_ppo_loss(
     data: TensorDict = None,
     dp_group=None,
     student_logits: torch.Tensor = None,
+    sampled_token_ids: torch.Tensor = None,
     data_format: str = "thd",
 ):
     """Loss function used both for logit processor and final policy loss.
@@ -202,7 +248,7 @@ def distillation_ppo_loss(
 
     # Called as logits processor
     if student_logits is not None:
-        return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
+        return compute_topk_loss(config, distillation_config, data, student_logits, data_format, sampled_token_ids)
 
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
@@ -291,7 +337,9 @@ def distillation_loss(
     return distillation_loss, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_topk", "reverse_kl_topk"], use_topk=True)
+)  # type: ignore[arg-type]
 def compute_forward_kl_topk(
     config: ActorConfig,
     distillation_config: DistillationConfig,
@@ -310,14 +358,44 @@ def compute_forward_kl_topk(
     teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
     overlap_count = model_output.get("overlap_count")
     overlap_token_advantage = model_output.get("overlap_token_advantage")
+    accumulated_count = model_output.get("accumulated_count")
     if overlap_count is not None and overlap_token_advantage is not None:
         overlap_count = no_padding_2_padding(overlap_count, data)
         overlap_token_advantage = no_padding_2_padding(overlap_token_advantage, data)
+    if accumulated_count is not None:
+        accumulated_count = no_padding_2_padding(accumulated_count, data)
     if data["response_mask"].is_nested:
         response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
     else:
         response_mask_bool = data["response_mask"].bool()
     assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+    
+    save_topk = False
+    if(save_topk == True):
+        debug_teacher_topk_ids = model_output.get("debug_teacher_topk_ids")
+        debug_student_topk_probs = model_output.get("debug_student_topk_probs")
+        debug_teacher_topk_probs = model_output.get("debug_teacher_topk_probs")
+        if (
+            debug_teacher_topk_ids is not None
+            and debug_student_topk_probs is not None
+            and debug_teacher_topk_probs is not None
+        ):
+            debug_teacher_topk_ids = no_padding_2_padding(debug_teacher_topk_ids, data)
+            debug_student_topk_probs = no_padding_2_padding(debug_student_topk_probs, data)
+            debug_teacher_topk_probs = no_padding_2_padding(debug_teacher_topk_probs, data)
+            assert debug_teacher_topk_ids.shape[:2] == response_mask_bool.shape
+            assert debug_student_topk_probs.shape == debug_teacher_topk_probs.shape == debug_teacher_topk_ids.shape
+            _dump_response_topk_probs(
+                data=data,
+                response_mask=response_mask_bool,
+                teacher_topk_ids=debug_teacher_topk_ids,
+                student_topk_probs=debug_student_topk_probs,
+                teacher_topk_probs=debug_teacher_topk_probs,
+            )
+        else:
+            raise ValueError(
+                "Debug top-k probabilities are not found in model output. Make sure the distillation loss function returns debug_teacher_topk_ids, debug_student_topk_probs, and debug_teacher_topk_probs when save_topk is True."
+            )
 
     overlap_metrics = {}
     if overlap_count is not None and overlap_token_advantage is not None:
@@ -336,6 +414,9 @@ def compute_forward_kl_topk(
             )
         else:
             overlap_metrics["distillation/overlap_token_advantage"] = 0.0
+    if accumulated_count is not None:
+        assert accumulated_count.shape == response_mask_bool.shape
+        overlap_metrics["distillation/accumulated_count"] = accumulated_count[response_mask_bool].float().mean().item()
 
     # Log amount of mass in the top-k log probabilities for both student and teacher.
     student_mass = student_mass[response_mask_bool]

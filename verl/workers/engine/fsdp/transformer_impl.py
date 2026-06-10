@@ -1136,11 +1136,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
                 if distillation_use_topk:
-                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                    outputs = logits_processor_func(
+                        student_logits=logits_rmpad.unsqueeze(0),
+                        sampled_token_ids=input_ids_rmpad_rolled.unsqueeze(0),
+                        data=micro_batch,
+                    )
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
                         v = v.squeeze(0)
-                        assert v.shape == log_probs.shape, f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
+                        assert v.shape[:1] == log_probs.shape, f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
                         if self.use_ulysses_sp:
                             pad_size = output_args["pad_size"]
                             v = gather_outputs_and_unpad(v, gather_dim=0, unpad_dim=0, padding_size=pad_size)
@@ -1219,10 +1223,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # populated in output_args along the use_remove_padding=True
                     # path of prepare_model_inputs.
                     if distillation_use_topk:
-                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                        outputs = logits_processor_func(
+                            student_logits=logits_rmpad.unsqueeze(0),
+                            sampled_token_ids=input_ids_rmpad_rolled.unsqueeze(0),
+                            data=micro_batch,
+                        )
                         for k, v in outputs.items():
                             v = v.squeeze(0)
-                            assert v.shape == log_probs.shape, (
+                            assert v.shape[:1] == log_probs.shape, (
                                 f"log_probs shape: {log_probs.shape}, {k} shape: {v.shape}"
                             )
                             model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)

@@ -131,3 +131,11 @@ logs
 log
 outputs
 .history
+
+rollout_generations/*
+*.err
+*.out
+validation_generations/*
+debug_topk_probs/*
+opd_toy_results/*
+.vscode/*
