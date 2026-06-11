@@ -222,6 +222,17 @@ def compute_reverse_kl_topk(
         # KL(student || teacher) on the reduced distribution over A''.
         token_kl = student_reduced_probs * (student_reduced_log_probs - teacher_reduced_log_probs)
         distillation_losses = token_kl.sum(dim=-1)
+    elif loss_type == "kltopk_approx_nosampled":
+        student_topk_probs = student_topk_log_probs.exp()
+        teacher_topk_probs = teacher_topk_log_probs.exp()
+        student_other_probs = (1.0 - student_topk_probs.sum(dim=-1, keepdim=True)).clamp_min(0.0)
+        teacher_other_probs = (1.0 - teacher_topk_probs.sum(dim=-1, keepdim=True)).clamp_min(0.0)
+        student_reduced_probs = torch.cat([student_topk_probs, student_other_probs], dim=-1)
+        teacher_reduced_probs = torch.cat([teacher_topk_probs, teacher_other_probs], dim=-1)
+        student_reduced_log_probs = student_reduced_probs.clamp_min(1e-12).log()
+        teacher_reduced_log_probs = teacher_reduced_probs.clamp_min(1e-12).log()
+        token_kl = student_reduced_probs * (student_reduced_log_probs - teacher_reduced_log_probs)
+        distillation_losses = token_kl.sum(dim=-1)
     elif loss_type == "kltopk_approx_mse": 
         sampled_token_ids_col = sampled_token_ids.unsqueeze(-1)
         sampled_not_in_topk = ~(teacher_topk_ids == sampled_token_ids_col).any(dim=-1, keepdim=True)

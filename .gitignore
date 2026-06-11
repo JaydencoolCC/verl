@@ -138,4 +138,5 @@ rollout_generations/*
 validation_generations/*
 debug_topk_probs/*
 opd_toy_results/*
-.vscode/*
+.vscode
+plot/*.png

@@ -37,7 +37,7 @@ class ToyConfig:
     #   "student_dppo_topk_tvd_opd"          : DPPO-style collapsed TVD, support = student top-k + sampled tokens + other
     #   "teacher_dppo_topk_tvd_opd"          : DPPO-style collapsed TVD, support = teacher top-k + sampled tokens + other
     #   "dppo_topk_tv_opd"                   : old DPPO-style behavior top-k + sampled token + other TVD
-    method: str = "teacher_dppo_topk_kl_mass_opd"
+    method: str = "teacher_dppo_topk_kl_opd"
 
 CONFIG = ToyConfig()
 torch.manual_seed(CONFIG.seed)
